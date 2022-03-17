@@ -2180,6 +2180,7 @@ module LowLevel =
     open System
     open System.IO
     open System.Text
+    open LanguageServerProtocol.Logging
 
     let headerBufferSize = 300
     let minimumHeaderLength = 21
@@ -2221,7 +2222,7 @@ module LowLevel =
         | None ->
             raise (EndOfStreamException())
 
-    let read (stream: Stream) =
+    let read (logger: ILog) (stream: Stream) =
         let headers = readHeaders stream
 
         let contentLength =
@@ -2233,13 +2234,31 @@ module LowLevel =
         if contentLength = None then
             failwithf "Content-Length header not found"
         else
+            let contentLengthStr =
+              match contentLength with
+              | Some cl -> cl |> string
+              | _ -> "No value"
+            logger.warn (Log.setMessage "Content-length from LspClient: {cl}" >> Log.addContextDestructured "cl" contentLengthStr)
             let result = Array.zeroCreate<byte> contentLength.Value
             let mutable readCount = 0
             while readCount < contentLength.Value do
                 let toRead = contentLength.Value - readCount
                 let readInCurrentBatch = stream.Read(result, readCount, toRead)
-                readCount <- readCount + readInCurrentBatch
+                if readInCurrentBatch > 0 then
+                  readCount <- readCount + readInCurrentBatch
+                else
+                  logger.warn (Log.setMessage "LSP Server encountered an unexpected end-of-stream at : {readcount}" >> Log.addContextDestructured "readcount" readCount)
+                  readCount <- contentLength.Value
+
             let str = Encoding.UTF8.GetString(result, 0, readCount)
+            let str2Log =
+              let len2Show = 100
+              if str.Length <= len2Show then
+                str
+              else
+                str.Substring(0, len2Show)
+
+            logger.warn (Log.setMessage "Returning str from LspClient: {str}" >> Log.addContextDestructured "str" str2Log)
             headers, str
 
     let write (stream: Stream) (data: string) =
@@ -3010,7 +3029,7 @@ module Server =
         let mutable quit = false
         while not quit do
             try
-                let _, requestString = LowLevel.read input
+                let _, requestString = LowLevel.read logger input
 
                 match handleClientMessage requestString with
                 | MessageHandlingResult.WasShutdown -> shutdownReceived <- true
@@ -3020,8 +3039,13 @@ module Server =
                 | MessageHandlingResult.Normal -> ()
             with
             | :? EndOfStreamException ->
+                logger.error (Log.setMessage "EndOfStreamException in LowLevel.read ")
                 quit <- true
             | ex ->
+                logger.error
+                  (Log.setMessage "Generic exception in LowLevel.read - {strex} at {st}"
+                  >> Log.addContextDestructured "strex" ex
+                  >> Log.addContextDestructured "st" ex.StackTrace)
                 ()
 
         match shutdownReceived, quitReceived with
@@ -3202,7 +3226,7 @@ module Client =
                 let outStream = proc.StandardOutput.BaseStream
                 while not quit do
                     try
-                        let _, notificationString = LowLevel.read outStream
+                        let _, notificationString = LowLevel.read logger outStream
                         // fprintfn stderr "[CLIENT] READING: %s" notificationString
                         messageHanlder notificationString
                     with
